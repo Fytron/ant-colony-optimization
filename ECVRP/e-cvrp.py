@@ -1,8 +1,12 @@
 import numpy as np
-import re
-# from scipy.spatial.distance import pdist, squareform
+import random
+import matplotlib.pyplot as plt
 
-# Set to true to print traversal
+# ACO Hyperparameters
+ALPHA = 1  # Pheromone importance
+BETA = 2   # Distance importance
+EVAPORATION_RATE = 0.5
+PHEROMONE_DEPOSIT = 1.0
 DEBUG = False
 
 def parse_evrp_data(file_path):
@@ -67,11 +71,10 @@ def create_distance_matrix(coordinates):
             if i != j:
                 dist_mat[i][j] = euclidean_distance(coordinates[i], coordinates[j])
             else:
-                dist_mat[i][j] = float('inf')  # Avoid zero distance to the same node
+                dist_mat[i][j] = float('inf')
 
     return dist_mat
 
-# Objective function for the E-CVRP
 def evrp_obj(x_ij, d_ij):
     total_distance = 0
     for i in range(len(x_ij)):
@@ -80,145 +83,199 @@ def evrp_obj(x_ij, d_ij):
                 total_distance += d_ij[i][j]
     return total_distance
 
-# Class defining candidate solutions a.k.a. agents
 class EV_Ant:
-    def __init__(self, number_of_nodes, dist_mat, battery_capacity, cargo_capacity, charging_stations, demands, depots):
-        self.position = np.random.permutation(number_of_nodes)
-        self.x_ij = np.zeros((number_of_nodes, number_of_nodes))
+    def __init__(self, dimensions, dist_mat, battery_capacity, cargo_capacity, charging_stations, demands, depots):
+        self.dimensions = dimensions
+        self.dist_mat = dist_mat
         self.battery_capacity = battery_capacity
         self.cargo_capacity = cargo_capacity
         self.charging_stations = charging_stations
-        self.current_battery = battery_capacity
-        self.current_cargo = cargo_capacity
         self.demands = demands
         self.depots = depots
+        
+        self.pheromone_trails = np.ones((dimensions, dimensions)) * 0.1
+        self.reset()
 
-        # Initial route construction
-        self.route_construction(number_of_nodes, dist_mat)
+    def reset(self):
+        self.position = np.random.permutation(self.dimensions)
+        self.x_ij = np.zeros((self.dimensions, self.dimensions))
+        self.current_battery = self.battery_capacity
+        self.current_cargo = self.cargo_capacity
+        self.quality = float('inf')
 
-    # def calculate_battery_consumption(self, from_node, to_node, dist_mat):
-    #     # Calculate battery consumption between two nodes
-    #     return dist_mat[from_node][to_node]
+    def probabilistic_node_selection(self, current_node, unvisited_nodes, global_pheromones):
+        probabilities = []
+        for node in unvisited_nodes:
+            # Probabilistic selection considering pheromones and distance
+            pheromone = global_pheromones[current_node][node]
+            visibility = 1 / (self.dist_mat[current_node][node] + 1e-10)
+            probabilities.append((node, pheromone ** ALPHA * visibility ** BETA))
+        
+        total = sum(prob for _, prob in probabilities)
+        probabilities = [(node, prob/total) for node, prob in probabilities]
+        return random.choices(probabilities, weights=[p for _, p in probabilities])[0][0]
 
-    def calculate_battery_consumption(self, from_node, to_node, dist_mat):
-        distance = dist_mat[from_node][to_node]
-        if DEBUG:
-            print(f"Distance from node {from_node} to node {to_node}: {distance}")
-        return distance
+    def calculate_battery_consumption(self, from_node, to_node):
+        return self.dist_mat[from_node][to_node]
 
-    def can_visit_next_node(self, current_node, next_node, dist_mat):
-        # next_node = next_node - 1
+    def can_visit_next_node(self, current_node, next_node):
         if next_node < 0 or next_node >= len(self.demands):
             return False
 
-        battery_needed = self.calculate_battery_consumption(current_node, next_node, dist_mat)
-        if DEBUG:
-            print(f"Battery need to visit {next_node} is {battery_needed}")
-        return self.current_battery >= battery_needed and self.current_cargo >= self.demands[next_node][1]
+        battery_needed = self.calculate_battery_consumption(current_node, next_node)
+        return (self.current_battery >= battery_needed and 
+                self.current_cargo >= self.demands[next_node][1])
 
-    def visit_node(self, current_node, next_node, dist_mat):
-        # Debugging
-        if DEBUG:
-            print(f"Visiting from node: {current_node}, to node: {next_node}")
-            print(f"Battery level: {self.current_battery}")
-            print(f"Cargo: {self.current_cargo}")
-
-        # Deduct the battery based on distance
-        self.current_battery -= self.calculate_battery_consumption(current_node, next_node, dist_mat)
-
-        # Deduct cargo only for customer nodes
-        if next_node not in self.charging_stations and next_node not in self.depots:
-            self.current_cargo -= self.demands[next_node][1]
-
-        # Mark the path as visited
-        self.x_ij[current_node][next_node] = 1
-
-    def recharge_battery(self):
-        # Recharge the battery to full capacity
-        self.current_battery = self.battery_capacity
-
-    def route_construction(self, number_of_nodes, dist_mat):
-        # Resetting battery and cargo for the start of the route construction
-        self.current_battery = self.battery_capacity
-        self.current_cargo = self.cargo_capacity
-        # Keep track of visited customer nodes
-        visited_nodes = set()  
-
-        # Start from the first node in the position array
-        current_node = self.position[0]
-
-        for i in range(1, number_of_nodes):
-            # Next node to visit
-            next_node = self.position[i]
-
-            # If the next node is a depot or charging station, it's okay to revisit
-            if next_node in self.depots or next_node in self.charging_stations:
-                pass
-            elif next_node in visited_nodes:
-                # Skip already visited customer nodes
+    def route_construction(self, global_pheromones):
+        self.reset()
+        
+        # Start from the depot
+        current_node = self.depots[0]
+        route = [current_node]
+        visited_nodes = set([current_node])
+        
+        nodes_to_visit = set(
+            node for node in range(self.dimensions) 
+            if node not in self.depots and node not in self.charging_stations
+        )
+        
+        while nodes_to_visit:
+            # Potential next nodes are unvisited customer nodes
+            potential_next_nodes = [
+                node for node in nodes_to_visit 
+                if self.can_visit_next_node(current_node, node)
+            ]
+            
+            # If no direct route is possible, use a charging station
+            if not potential_next_nodes:
+                # Find the nearest charging station
+                potential_stations = [
+                    station for station in self.charging_stations 
+                    if station not in visited_nodes
+                ]
+                
+                if not potential_stations:
+                    break
+                
+                # Select charging station probabilistically
+                next_station = self.probabilistic_node_selection(
+                    current_node, 
+                    potential_stations, 
+                    global_pheromones
+                )
+                
+                # Recharge and update route
+                route.append(next_station)
+                visited_nodes.add(next_station)
+                self.current_battery = self.battery_capacity
+                current_node = next_station
                 continue
-
-            # Check if the next node can be visited
-            if self.can_visit_next_node(current_node, next_node, dist_mat):
-                self.visit_node(current_node, next_node, dist_mat)
-                if next_node not in self.depots and next_node not in self.charging_stations:
-                    visited_nodes.add(next_node)  # Mark customer nodes as visited
-
-            # Update the current node to the one just visited
+            
+            # Select next node probabilistically
+            next_node = self.probabilistic_node_selection(
+                current_node, 
+                potential_next_nodes, 
+                global_pheromones
+            )
+            
+            # Update route details
+            battery_consumption = self.calculate_battery_consumption(current_node, next_node)
+            self.current_battery -= battery_consumption
+            self.current_cargo -= self.demands[next_node][1]
+            
+            # Update tracking information
+            route.append(next_node)
+            visited_nodes.add(next_node)
+            nodes_to_visit.remove(next_node)
+            self.x_ij[current_node][next_node] = 1
             current_node = next_node
+        
+        # Return to depot
+        if current_node != self.depots[0]:
+            self.x_ij[current_node][self.depots[0]] = 1
+            route.append(self.depots[0])
+        
+        self.position = route
+        self.quality = evrp_obj(self.x_ij, self.dist_mat)
+        return route
 
-        # Returning to the starting depot at the end of the route
-        start_depot = self.depots[0]
-        self.visit_node(current_node, start_depot, dist_mat)
-
-        # Calculate the quality of the constructed route
-        self.quality = evrp_obj(self.x_ij, dist_mat)
-
-# Ant Colony Optimization function for E-CVRP
-def ant_colony_optimization_evrp(file_path):
-    # Parse the data
+def ant_colony_optimization_evrp(file_path, num_generations=20, population_size=10, plot=True):
+    # Parse problem data
     parsed_data = parse_evrp_data(file_path)
-
-    # Extract data from the parsed data
+    
     coordinates = parsed_data['coordinates']
     demands = parsed_data['demands']
-    station_coords = parsed_data['station_coords']
+    stations = parsed_data['station_coords']
     depots = parsed_data['depots']
     dimensions = parsed_data['dimension']
     battery_capacity = parsed_data['battery_capacity']
     cargo_capacity = parsed_data['cargo_capacity']
-    stations = parsed_data['station_coords']
-    depots = parsed_data['depots']
-
     
-    # points = np.array([coords[1:] for coords in coordinates])
-    # dist_mat = squareform(pdist(points, 'euclidean'))
-    # Generate distance matrix
+    # Create distance matrix
     dist_mat = create_distance_matrix(coordinates)
-
-    # Population initialization
-    gen = 10
-    pop = 20
-
-    print(f"Starting run with...\nGen: {gen}\tPop: {pop}\tDemands: {len(demands)}")
-
-    population = [EV_Ant(dimensions, dist_mat, battery_capacity, cargo_capacity, stations, demands, depots) for _ in range(pop)]
-    gbest = min(population, key=lambda ant: ant.quality)
-
+    
+    # Initialize global pheromone trails
+    global_pheromones = np.ones((dimensions, dimensions)) * 0.1
+    
+    # Initialize population
+    population = [
+        EV_Ant(dimensions, dist_mat, battery_capacity, cargo_capacity, stations, demands, depots) 
+        for _ in range(population_size)
+    ]
+    
+    # Best solution tracking
+    gbest = None
+    
     # Optimization loop
-    for j in range(gen):
+    for generation in range(num_generations):
+        # Construct routes for each ant
         for ant in population:
-            ant.route_construction(dimensions, dist_mat)
+            ant.route_construction(global_pheromones)
+        
+        # Update best solution
+        current_best = min(population, key=lambda ant: ant.quality)
+        if gbest is None or current_best.quality < gbest.quality:
+            gbest = current_best
+        
+        # Pheromone update
+        global_pheromones *= (1 - EVAPORATION_RATE)
+        for ant in population:
+            route_pheromone = PHEROMONE_DEPOSIT / ant.quality
+            for i in range(len(ant.position) - 1):
+                global_pheromones[ant.position[i]][ant.position[i+1]] += route_pheromone
+    
+    # Visualization of routes and pheromones
+    plt.figure(figsize=(15, 5))
+    
+    plt.subplot(121)
+    plt.imshow(global_pheromones, cmap='YlGnBu')
+    plt.colorbar(label='Pheromone Intensity')
+    plt.title('Pheromone Trails')
+    
+    plt.subplot(122)
+    coordinates_array = np.array(coordinates)
+    plt.scatter(coordinates_array[:, 0], coordinates_array[:, 1], c='gray', alpha=0.5)
+    
+    best_route_coords = [coordinates[node] for node in gbest.position]
+    best_route_coords = np.array(best_route_coords)
+    
+    plt.plot(best_route_coords[:, 0], best_route_coords[:, 1], 'r-', linewidth=2)
+    
+    # Highlight stations and depot
+    for station in stations:
+        plt.scatter(coordinates[station][0], coordinates[station][1], c='blue', marker='s')
+    
+    for depot in depots:
+        plt.scatter(coordinates[depot][0], coordinates[depot][1], c='green', marker='*', s=200)
+    
+    plt.title('Best Route')
+    plt.tight_layout()
+    plt.show()
+    
+    return gbest.position, gbest.quality
 
-        # Update the best solution
-        iter_best = min(population, key=lambda ant: ant.quality)
-        if iter_best.quality < gbest.quality:
-            gbest = iter_best
-
-    print(f"The best solution found: {gbest.position} with quality: {gbest.quality}")
-
-# Set the path for E-CVRP data
-# file_path = 'e-cvrp_benchmark_instances-master/E-n112-k8-s11.evrp'
-file_path = 'e-cvrp_benchmark_instances-master/X-n469-k26-s10.evrp'
-# Start the ant colony
-ant_colony_optimization_evrp(file_path)
+# Solve the problem
+file_path = 'e-cvrp_benchmark_instances-master/E-n35-k3-s5.evrp'
+best_route, best_quality = ant_colony_optimization_evrp(file_path, num_generations=100, population_size=100, plot=True)
+print(f"Best Route: {best_route}")
+print(f"Route Quality: {best_quality}")
